@@ -8,26 +8,21 @@ import (
 	"log"
 	"strings"
 	"time"
+	"tskmgr/pkg/models"
 
 	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
 )
 
 // Структура данных для задачи
-type Task struct {
-	ID         int      `json:"id"`
-	Opened     int64    `json:"opened"`
-	Closed     int64    `json:"closed"`
-	AuthorID   int      `json:"author_id"`
-	AssignedID int      `json:"assigned_id"`
-	Title      string   `json:"title"`
-	Content    string   `json:"content"`
-	Labels     []string `json:"labels"` // Метки (labels)
-}
 
 // Хранилище для работы с задачами
 type TaskStorage struct {
 	DB *pgxpool.Pool
+}
+
+func NewTaskStorage(db *pgxpool.Pool) *TaskStorage {
+	return &TaskStorage{DB: db}
 }
 
 func NewDBConnection() (*pgxpool.Pool, error) {
@@ -59,35 +54,29 @@ func NewDBConnection() (*pgxpool.Pool, error) {
 }
 
 // Создание новой задачи с метками
-func (s *TaskStorage) CreateTask(task Task) (int, error) {
-	var taskID int
-	task.Opened = time.Now().Unix()
-
+func (s *TaskStorage) CreateTask(task models.Task) (int, error) {
+	// Начало транзакции
 	tx, err := s.DB.Begin(context.Background())
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback(context.Background())
 
-	// Вставка задачи
-	query := `
-		INSERT INTO tasks (opened, closed, author_id, assigned_id, title, content)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id;
-	`
-	err = tx.QueryRow(context.Background(), query, task.Opened, task.Closed, task.AuthorID, task.AssignedID, task.Title, task.Content).Scan(&taskID)
+	// Создание задачи
+	taskID, err := s.createTaskWithTx(tx, task)
 	if err != nil {
 		return 0, err
 	}
 
 	// Добавление меток (если есть)
 	if len(task.Labels) > 0 {
-		err = s.addLabelsToTask(tx, taskID, task.Labels)
+		err = s.addLabelsToTaskWithTx(tx, taskID, task.Labels)
 		if err != nil {
 			return 0, err
 		}
 	}
 
+	// Коммит транзакции
 	err = tx.Commit(context.Background())
 	if err != nil {
 		return 0, err
@@ -97,7 +86,7 @@ func (s *TaskStorage) CreateTask(task Task) (int, error) {
 }
 
 // Получение списка всех задач
-func (s *TaskStorage) GetAllTasks() ([]Task, error) {
+func (s *TaskStorage) GetAllTasks() ([]models.Task, error) {
 	query := `
 		SELECT t.id, t.opened, t.closed, t.author_id, t.assigned_id, t.title, t.content, COALESCE(array_agg(label.name), '{}') as labels
 		FROM tasks t
@@ -115,7 +104,7 @@ func (s *TaskStorage) GetAllTasks() ([]Task, error) {
 }
 
 // Получение задач по автору
-func (s *TaskStorage) GetTasksByAuthor(authorID int) ([]Task, error) {
+func (s *TaskStorage) GetTasksByAuthor(authorID int) ([]models.Task, error) {
 	query := `
 		SELECT t.id, t.opened, t.closed, t.author_id, t.assigned_id, t.title, t.content, COALESCE(array_agg(label.name), '{}') as labels
 		FROM tasks t
@@ -135,7 +124,7 @@ func (s *TaskStorage) GetTasksByAuthor(authorID int) ([]Task, error) {
 }
 
 // Получение задач по метке
-func (s *TaskStorage) GetTasksByLabel(labelName string) ([]Task, error) {
+func (s *TaskStorage) GetTasksByLabel(labelName string) ([]models.Task, error) {
 	query := `
 		SELECT t.id, t.opened, t.closed, t.author_id, t.assigned_id, t.title, t.content, COALESCE(array_agg(label.name), '{}') as labels
 		FROM tasks t
@@ -155,7 +144,7 @@ func (s *TaskStorage) GetTasksByLabel(labelName string) ([]Task, error) {
 }
 
 // Обновление задачи по ID
-func (s *TaskStorage) UpdateTask(task Task) error {
+func (s *TaskStorage) UpdateTask(task models.Task) error {
 	query := "UPDATE tasks SET "
 	var updates []string
 	var args []interface{}
@@ -259,12 +248,54 @@ func (s *TaskStorage) addLabelsToTask(tx pgx.Tx, taskID int, labels []string) er
 	return nil
 }
 
+func (s *TaskStorage) addLabelsToTaskWithTx(tx pgx.Tx, taskID int, labels []string) error {
+	for _, label := range labels {
+		var labelID int
+		// Вставка метки или обновление существующей
+		err := tx.QueryRow(context.Background(), `
+            INSERT INTO labels (name) VALUES ($1)
+            ON CONFLICT (name) DO UPDATE SET name=EXCLUDED.name
+            RETURNING id;
+        `, label).Scan(&labelID)
+		if err != nil {
+			return err
+		}
+
+		// Привязка метки к задаче
+		_, err = tx.Exec(context.Background(), `
+            INSERT INTO tasks_labels (task_id, label_id) VALUES ($1, $2);
+        `, taskID, labelID)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *TaskStorage) createTaskWithTx(tx pgx.Tx, task models.Task) (int, error) {
+	var taskID int
+	task.Opened = time.Now().Unix()
+
+	// Вставка задачи
+	query := `
+        INSERT INTO tasks (opened, closed, author_id, assigned_id, title, content)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id;
+    `
+	err := tx.QueryRow(context.Background(), query, task.Opened, task.Closed, task.AuthorID, task.AssignedID, task.Title, task.Content).Scan(&taskID)
+	if err != nil {
+		return 0, err
+	}
+
+	return taskID, nil
+}
+
 // Вспомогательная функция для обработки результата выборки задач
-func (s *TaskStorage) scanTasks(rows pgx.Rows) ([]Task, error) {
-	var tasks []Task
+func (s *TaskStorage) scanTasks(rows pgx.Rows) ([]models.Task, error) {
+	var tasks []models.Task
 
 	for rows.Next() {
-		var task Task
+		var task models.Task
 		var labels sql.NullString
 		err := rows.Scan(&task.ID, &task.Opened, &task.Closed, &task.AuthorID, &task.AssignedID, &task.Title, &task.Content, &labels)
 		if err != nil {
